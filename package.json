@@ -1,0 +1,31 @@
+{
+    "name": "portfolio-mcp",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dashboard": "vite"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "@types/node": "^26.1.0",
+        "react": "^19.2.7",
+        "react-dom": "^19.2.7",
+        "recharts": "^3.9.2",
+        "typescript": "^6.0.3",
+        "zod": "^4.4.3"
+    },
+    "type": "module",
+    "bin": {
+        "portfolio-mcp": "dist/index.js"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-react": "^6.0.3",
+        "vite": "^8.1.3"
+    }
+}
