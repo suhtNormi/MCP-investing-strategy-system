@@ -10,6 +10,7 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const DATA_FILE = path.join(DATA_DIR, "portfolio.json");
 const PLAN_FILE = path.join(DATA_DIR, "investment-plan.json");
+const MONEY_FILE = path.join(DATA_DIR, "money-system.json");
 
 const LEGACY_FILE = path.join(os.homedir(), ".portfolio-mcp", "portfolio.json");
 if (!fs.existsSync(DATA_FILE) && fs.existsSync(LEGACY_FILE)) {
@@ -331,27 +332,239 @@ function loadPlan(): Record<string, unknown> | null {
     }
 }
 
+// money system — the non-portfolio levers the dashboard runs on.
+// Shared with the dashboard via data/money-system.json (dashboard wizard writes it too).
+
+const MoneySystem = z.object({
+    income: z.number().nonnegative().describe("net monthly income, EUR"),
+    expenses: z.number().nonnegative().describe("monthly living costs excluding housing, EUR"),
+    housingPmt: z.number().nonnegative().describe("monthly housing payment (mortgage or rent), EUR"),
+    bufferEur: z.number().nonnegative().describe("emergency buffer in instantly available cash, EUR"),
+    bufferMonthsTarget: z.number().nonnegative().describe("user's own emergency-buffer target, in months of essential costs (Kress recommends 6–9; default 6)"),
+    homeEquity: z.number().nonnegative().describe("home value minus remaining loan, EUR (0 if renting)"),
+    mortgageBalance: z.number().nonnegative().describe("remaining mortgage loan principal still owed, EUR (0 if paid off or renting)"),
+    investEur: z.number().nonnegative().describe("monthly amount invested, EUR"),
+    extraIncome: z.number().nonnegative().describe("planned income increase, EUR/month"),
+    playEur: z.number().nonnegative().describe("play-money / speculation pocket current value, EUR"),
+    annualReturn: z.number().describe("expected annual return %, projection only"),
+    hasPlan: z.boolean().describe("whether a written investment plan exists"),
+});
+type MoneySystem = z.infer<typeof MoneySystem>;
+
+const EMPTY_MONEY: MoneySystem = {
+    income: 0, expenses: 0, housingPmt: 0, bufferEur: 0, bufferMonthsTarget: 6, homeEquity: 0,
+    mortgageBalance: 0, investEur: 0, extraIncome: 0, playEur: 0, annualReturn: 7, hasPlan: false,
+};
+
+function loadMoney(): MoneySystem | null {
+    try {
+        const raw = JSON.parse(fs.readFileSync(MONEY_FILE, "utf-8"));
+        return { ...EMPTY_MONEY, ...MoneySystem.partial().parse(raw) };
+    } catch {
+        return null;
+    }
+}
+
+function saveMoney(m: MoneySystem): void {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(MONEY_FILE, JSON.stringify({ ...m, updatedAt: new Date().toISOString() }, null, 2));
+}
+
+function moneyOverview(m: MoneySystem) {
+    const holdings = loadPortfolio();
+    const invested = holdings.reduce((s, h) => s + h.amountEur, 0);
+    const essentials = m.expenses + m.housingPmt;
+    const freeCash = m.income - essentials;
+    const bufferMonths = essentials > 0 ? m.bufferEur / essentials : null;
+    const targetMonths = m.bufferMonthsTarget ?? 6;
+    const bufferTargetEur = essentials * targetMonths; // user's own target; Kress recommends 6–9
+    return {
+        essentialsPerMonth: essentials,
+        freeCashPerMonth: freeCash,
+        savingsRate: m.income > 0 ? pct(Math.max(0, freeCash), m.income) : "n/a",
+        emergencyBuffer: {
+            eur: m.bufferEur,
+            months: bufferMonths === null ? null : round2(bufferMonths),
+            userTarget: `${targetMonths} months of essentials = ${round2(bufferTargetEur)} EUR`,
+            kressRecommendation: `6–9 months of essentials = ${essentials * 6}–${essentials * 9} EUR`,
+            gapToTarget: Math.max(0, round2(bufferTargetEur - m.bufferEur)),
+            saareCounterView: "a large liquid portfolio + stable income can substitute — a design choice, not dogma",
+        },
+        home: {
+            equityEur: m.homeEquity,
+            mortgageBalanceEur: m.mortgageBalance,
+            propertyValueEur: round2(m.homeEquity + m.mortgageBalance),
+            equityShareOfHome: m.homeEquity + m.mortgageBalance > 0 ? pct(m.homeEquity, m.homeEquity + m.mortgageBalance) : "n/a",
+        },
+        investedPortfolioEur: invested,
+        liquidEur: invested + m.bufferEur + m.playEur,
+        netWorthEur: invested + m.bufferEur + m.playEur + m.homeEquity,
+        unallocatedSlackPerMonth: Math.max(0, freeCash - m.investEur),
+    };
+}
+
+const NO_MONEY_MSG =
+    "No money system saved yet (data/money-system.json). Ask the user for their numbers and call update_money_system, " +
+    "or have them run the dashboard setup wizard (npm run dashboard). Fields: income, expenses, housingPmt, bufferEur, " +
+    "bufferMonthsTarget, homeEquity, mortgageBalance, investEur, extraIncome, playEur, annualReturn, hasPlan.";
+
+// pre-save verification — holds a candidate purchase against the reference investors'
+// published bars and the portfolio's post-purchase balances. Thresholds mirror the
+// dashboard's meters/scorecards so both front ends flag at the same lines.
+
+const BARS = {
+    singleName: 0.10,  // Kress: any single name stays a few % — dashboard "act" line
+    baltic: 0.25,      // dashboard "act" line for Baltic home bias
+    speculation: 0.15, // Kress's 10–15% fence, upper edge
+    coreMin: 0.40,     // both scorecards: broad index core below 40% is a miss
+    equityMax: 0.95,   // dashboard "act" line for equity exposure of liquid assets
+};
+
+type HoldingWarning = { rule: string; who: string; numbers: string; principle: string };
+
+const SINGLE_TYPES = ["dividend_stock", "growth_stock", "reit"];
+const SPEC_TYPES = ["crypto", "commodity", "other"];
+const EQUITY_TYPES = ["index_fund", ...SINGLE_TYPES];
+
+function verifyHolding(candidate: Holding, holdings: Holding[], existingIdx: number): HoldingWarning[] {
+    const next = existingIdx >= 0
+        ? holdings.map((h, i) => (i === existingIdx ? candidate : h))
+        : [...holdings, candidate];
+    const total = next.reduce((s, h) => s + h.amountEur, 0);
+    if (total <= 0) return [];
+
+    const m = loadMoney(); // may be null — money-dependent rules are skipped then
+    const sum = (f: (h: Holding) => boolean) => next.filter(f).reduce((s, h) => s + h.amountEur, 0);
+    const liquid = total + (m ? m.bufferEur + m.playEur : 0);
+    const pc = (x: number) => `${(x * 100).toFixed(1)}%`;
+    const warnings: HoldingWarning[] = [];
+
+    // 1. single-name concentration (the candidate itself is the oversized name)
+    if (SINGLE_TYPES.includes(candidate.type)) {
+        const share = candidate.amountEur / total;
+        if (share > BARS.singleName) {
+            warnings.push({
+                rule: "single_name_concentration", who: "Kress",
+                numbers: `"${candidate.name}" would be ${pc(share)} of the invested portfolio — over the ${pc(BARS.singleName)} line`,
+                principle: "He spreads ~60 names so no single dividend cut matters; any one position stays a few percent.",
+            });
+        }
+    }
+
+    // 2. speculation fence, and buffer-before-speculation
+    if (SPEC_TYPES.includes(candidate.type)) {
+        const specShare = (sum((h) => SPEC_TYPES.includes(h.type)) + (m?.playEur ?? 0)) / liquid;
+        if (specShare > BARS.speculation) {
+            warnings.push({
+                rule: "speculation_over_fence", who: "Kress",
+                numbers: `speculative assets (crypto/commodity/other + play money) would reach ${pc(specShare)} of liquid assets — his fence is 10–15%`,
+                principle: "Cap the speculative pocket at ~10–15% so gambling urges never touch the long-term core.",
+            });
+        }
+        if (m) {
+            const essentials = m.expenses + m.housingPmt;
+            const targetMonths = m.bufferMonthsTarget ?? 6;
+            const months = essentials > 0 ? m.bufferEur / essentials : null;
+            if (months !== null && targetMonths > 0 && months < targetMonths) {
+                warnings.push({
+                    rule: "buffer_before_speculation", who: "Kress",
+                    numbers: `the emergency buffer is at ${months.toFixed(1)} of the user's ${targetMonths}-month target`,
+                    principle: "Barbell: fill the zero-risk cash end before adding to the speculative end.",
+                });
+            }
+        }
+    }
+
+    // 3. Baltic home bias
+    if (candidate.region === "baltics") {
+        const share = sum((h) => h.region === "baltics") / total;
+        if (share > BARS.baltic) {
+            warnings.push({
+                rule: "baltic_home_bias", who: "both",
+                numbers: `Baltic holdings would be ${pc(share)} of the portfolio — over the ${pc(BARS.baltic)} line`,
+                principle: "Kress largely exited Nasdaq Baltic (reliable dividend growers are scarce); Saare keeps home markets small and rides the US.",
+            });
+        }
+    }
+
+    // 4. core before satellite — buying singles/speculation while the index core is under both investors' bar
+    if (SINGLE_TYPES.includes(candidate.type) || SPEC_TYPES.includes(candidate.type)) {
+        const coreShare = sum((h) => h.type === "index_fund") / total;
+        if (coreShare < BARS.coreMin) {
+            warnings.push({
+                rule: "core_below_bar", who: "both",
+                numbers: `the broad index core would be ${pc(coreShare)} of the portfolio — both investors' miss line is ${pc(BARS.coreMin)}`,
+                principle: "Regular purchases of broad, low-cost index funds come before single stocks and side bets.",
+            });
+        }
+    }
+
+    // 5. no ballast — only judged when the money system (real cash buffer) is known
+    if (m && EQUITY_TYPES.includes(candidate.type)) {
+        const equityShare = sum((h) => EQUITY_TYPES.includes(h.type)) / liquid;
+        if (equityShare > BARS.equityMax) {
+            warnings.push({
+                rule: "no_ballast", who: "Kress",
+                numbers: `equities would be ${pc(equityShare)} of liquid assets — nothing tempers a crash`,
+                principle: "Not 100% equities: cash and bonds temper a ~-50% drawdown (80/20 historically cut it to ~-41%).",
+            });
+        }
+    }
+
+    return warnings;
+}
+
 // MCP server setup
 
-const server = new McpServer({ name: "portfolio-mcp", version: "1.2.0" });
+const server = new McpServer({ name: "portfolio-mcp", version: "1.4.0" });
 
 server.registerTool(
     "upsert_holding",
     {
-        title: "Add or update a holding",
+        title: "Add or update a holding (verified against the investors' principles)",
         description:
             "Add a holding to the portfolio, or update it if a holding with the same name exists. " +
             "Provide a Yahoo Finance ticker (e.g. SXR8.DE, TSM1T.TL, AAPL) whenever you can: on first save the current " +
-            "price is snapshotted and amountEur becomes the cost basis, so refresh_prices can track earnings from then on.",
-        inputSchema: Holding.omit({ costBasisEur: true, snapshotPrice: true, snapshotAt: true }).shape,
+            "price is snapshotted and amountEur becomes the cost basis, so refresh_prices can track earnings from then on. " +
+            "IMPORTANT: the purchase is first verified against the reference investors' published bars and the portfolio's " +
+            "resulting balances. If it gets flagged, NOTHING is saved — the response lists the reasons; present them to the " +
+            "user and ask whether to add it anyway. Only after the user explicitly confirms, call again with the same " +
+            "arguments plus acknowledgeWarnings: true. Never set acknowledgeWarnings on your own initiative.",
+        inputSchema: {
+            ...Holding.omit({ costBasisEur: true, snapshotPrice: true, snapshotAt: true }).shape,
+            acknowledgeWarnings: z.boolean().optional().describe(
+                "set true ONLY after the user has seen the warnings from a previous call and explicitly chosen to proceed anyway",
+            ),
+        },
     },
     async (input) => {
+        const { acknowledgeWarnings, ...data } = input;
         const holdings = loadPortfolio();
         const idx = holdings.findIndex(
-            (h) => h.name.toLowerCase() === input.name.toLowerCase(),
+            (h) => h.name.toLowerCase() === data.name.toLowerCase(),
         );
         const existing = idx >= 0 ? holdings[idx] : undefined;
-        const holding: Holding = { ...existing, ...Holding.parse({ ...input }) };
+        const holding: Holding = { ...existing, ...Holding.parse({ ...data }) };
+
+        // verify against the reference investors' bars before touching the file
+        const warnings = verifyHolding(holding, holdings, idx);
+        if (warnings.length > 0 && !acknowledgeWarnings) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text:
+                            `NOT SAVED — "${holding.name}" (${holding.amountEur} EUR) was flagged against the reference investors' principles:\n\n` +
+                            warnings.map((w, i) => `${i + 1}. [${w.who}] ${w.numbers}.\n   Principle: ${w.principle}`).join("\n") +
+                            (loadPlan()
+                                ? `\n\nThe user also has a written investment declaration — consider calling get_investment_plan and holding this purchase against their own written rules too.`
+                                : "") +
+                            `\n\nPresent these reasons to the user and ask whether they still want to add the holding. ` +
+                            `If — and only if — they explicitly confirm, call upsert_holding again with the same arguments plus acknowledgeWarnings: true.`,
+                    },
+                ],
+            };
+        }
 
         if (existing && existing.ticker === holding.ticker) {
             holding.costBasisEur = existing.costBasisEur;
@@ -377,9 +590,12 @@ server.registerTool(
         if (idx >= 0) holdings[idx] = holding;
         else holdings.push(holding);
         savePortfolio(holdings);
+        const verdict = warnings.length > 0
+            ? ` Saved despite ${warnings.length} warning(s) — the user chose to proceed (${warnings.map((w) => w.rule).join(", ")}).`
+            : ` Passed the investors' checks.`;
         return {
             content: [
-                { type: "text", text: `Saved "${holding.name}" (${holding.amountEur} EUR). Portfolio now has ${holdings.length} positions.${priceNote}` },
+                { type: "text", text: `Saved "${holding.name}" (${holding.amountEur} EUR). Portfolio now has ${holdings.length} positions.${verdict}${priceNote}` },
             ],
         };
     },
@@ -554,6 +770,129 @@ server.registerTool(
                     text: plan
                         ? JSON.stringify(plan, null, 2)
                         : "No investment plan saved yet. Offer to write one together — call get_investment_plan_guide to run the guided interview.",
+                },
+            ],
+        };
+    },
+);
+
+server.registerTool(
+    "get_money_system",
+    {
+        title: "Get the money system (levers + derived numbers)",
+        description:
+            "Returns the user's non-portfolio money levers — income, living costs, housing payment, emergency buffer, home equity, " +
+            "monthly investing amount, planned income increase, play money — plus derived numbers: free cash, savings rate, buffer " +
+            "months vs Kress's 6–9 month target, liquid assets and net worth. This is the same data the dashboard runs on. " +
+            "Call it before advising on savings, buffers, mortgage or income questions.",
+        inputSchema: {},
+    },
+    async () => {
+        const m = loadMoney();
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: m
+                        ? JSON.stringify({ levers: m, derived: moneyOverview(m) }, null, 2)
+                        : NO_MONEY_MSG,
+                },
+            ],
+        };
+    },
+);
+
+server.registerTool(
+    "update_money_system",
+    {
+        title: "Update money-system levers",
+        description:
+            "Set one or more money-system levers to new absolute values (EUR/month or EUR). Only pass the fields the user actually " +
+            "gave you — the rest keep their saved values. Use this for statements like 'my salary is now 3000' or 'I have 5000 in " +
+            "savings'. For incremental events prefer log_mortgage_payment (mortgage principal → home equity) and log_buffer_change " +
+            "(deposits/withdrawals to the emergency buffer). The dashboard shows changes on its next refresh.",
+        inputSchema: MoneySystem.partial().shape,
+    },
+    async (input) => {
+        const existing = loadMoney();
+        const m: MoneySystem = { ...(existing ?? EMPTY_MONEY), ...MoneySystem.partial().parse(input) };
+        saveMoney(m);
+        const untouched = existing
+            ? ""
+            : " Note: this created a fresh money system — every field not passed is still 0; confirm the rest with the user or the dashboard wizard.";
+        return {
+            content: [
+                {
+                    type: "text",
+                    text:
+                        `Updated ${Object.keys(input).join(", ") || "nothing"}.${untouched}\n` +
+                        JSON.stringify({ levers: m, derived: moneyOverview(m) }, null, 2),
+                },
+            ],
+        };
+    },
+);
+
+server.registerTool(
+    "log_mortgage_payment",
+    {
+        title: "Log a mortgage payment (principal → home equity)",
+        description:
+            "Record a mortgage payment: the principal portion moves from the loan balance into home equity (interest buys nothing, " +
+            "so pass only the principal). Use when the user says things like 'paid my mortgage, 550 of it was principal'. If they only " +
+            "give the total payment, ask for the principal split or check housingPmt via get_money_system first.",
+        inputSchema: {
+            principalEur: z.number().positive().describe("the principal portion of the payment, EUR"),
+        },
+    },
+    async ({ principalEur }) => {
+        const m = loadMoney();
+        if (!m) return { content: [{ type: "text", text: NO_MONEY_MSG }] };
+        m.homeEquity = round2(m.homeEquity + principalEur);
+        const before = m.mortgageBalance;
+        m.mortgageBalance = Math.max(0, round2(m.mortgageBalance - principalEur));
+        saveMoney(m);
+        const balNote =
+            before > 0
+                ? ` Remaining mortgage: ${before} → ${m.mortgageBalance} EUR.`
+                : " (No mortgage balance was recorded — set one via update_money_system or the dashboard to track the payoff.)";
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Home equity +${principalEur} EUR → ${m.homeEquity} EUR.${balNote} The dashboard picks this up on refresh.`,
+                },
+            ],
+        };
+    },
+);
+
+server.registerTool(
+    "log_buffer_change",
+    {
+        title: "Log an emergency-buffer deposit or withdrawal",
+        description:
+            "Adjust the emergency cash buffer by a delta: positive for money saved into it ('put 200 into savings'), negative for " +
+            "money taken out. Returns the new buffer and how many months of essential costs it covers vs Kress's 6–9 month target.",
+        inputSchema: {
+            deltaEur: z.number().describe("EUR to add (positive) or remove (negative) from the buffer"),
+        },
+    },
+    async ({ deltaEur }) => {
+        const m = loadMoney();
+        if (!m) return { content: [{ type: "text", text: NO_MONEY_MSG }] };
+        m.bufferEur = Math.max(0, round2(m.bufferEur + deltaEur));
+        saveMoney(m);
+        const o = moneyOverview(m);
+        return {
+            content: [
+                {
+                    type: "text",
+                    text:
+                        `Buffer ${deltaEur >= 0 ? "+" : ""}${deltaEur} EUR → ${m.bufferEur} EUR` +
+                        (o.emergencyBuffer.months !== null
+                            ? ` (${o.emergencyBuffer.months} months of essentials; ${o.emergencyBuffer.gapToTarget} EUR short of the ${m.bufferMonthsTarget}-month target).`
+                            : "."),
                 },
             ],
         };

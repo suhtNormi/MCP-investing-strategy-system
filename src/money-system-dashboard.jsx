@@ -54,12 +54,26 @@ const bucketOf = (h) =>
                 : h.type === "cash" ? "cash" : "spec";
 const BUCKET_LABEL = { index: "Broad index funds", singles: "Single names & REITs", bonds: "Bonds", cash: "Cash-like", spec: "Crypto / commodity / other" };
 
-// section order + display titles for the investment plan written via Claude
+// section order + display titles for the investment plan (Kress's "declaration")
 const PLAN_TITLES = {
     goal: "Goal", horizon: "Horizon", targetAllocation: "Target allocation",
     allowedInstruments: "Allowed universe", monthlyInvestment: "Monthly contribution",
     bufferPolicy: "Buffer policy", speculationCap: "Speculation cap", incomePlan: "Income plan",
     rebalancing: "Rebalancing & rules", reviewCadence: "Review cadence", constraints: "Constraints & notes",
+};
+// one-line prompts for the inline editor — mirror the MCP guide's questions & investor truths
+const PLAN_HINTS = {
+    goal: "What is the money for, and how much is 'enough'? A number or a lifestyle, but concrete (Saare: vague goals produce vague behavior).",
+    horizon: "When is it needed — decades, or partly sooner (home, sabbatical)? Kress: horizon sets how much equity risk is survivable.",
+    targetAllocation: "Target split between equities, bonds, cash, real estate, speculation, in %. Kress: 80/20 cut max drawdown to ~−41%; Saare: rough thirds.",
+    allowedInstruments: "Which instruments are allowed (broad UCITS ETFs, single names, bonds…) and which are excluded? Kress: ETFs before singles.",
+    monthlyInvestment: "How much goes in every month, before anything else, and where by default? Saare: pay yourself first.",
+    bufferPolicy: "How many months of essentials stay in cash, and the line where you'd rebuild before investing? Kress 6–9; Saare runs lower behind a big liquid portfolio.",
+    speculationCap: "Hard % of liquid assets allowed in the play pocket, and what happens when it outgrows the cap? Kress: ~10–15%.",
+    incomePlan: "Concrete next move to raise income (raise, switch, side income) and by how much/month? Saare's 10x-growth point.",
+    rebalancing: "When do you rebalance to target, and what's the rule for a −40% crash? Kress: follow the document, not the mood.",
+    reviewCadence: "How often is the plan itself reviewed, and when may it change (never mid-crash)?",
+    constraints: "Anything else binding: ethical exclusions, tax setup (investeerimiskonto/company), liquidity needs, max position sizes. (optional)",
 };
 
 // rough 2008-style stress drawdowns per asset type (broad-brush, for orientation only)
@@ -129,7 +143,7 @@ const MODELS = {
 const PROFILE_KEY = "money-system-profile-v1";
 const DEFAULT_PROFILE = {
     income: 2600, expenses: 1200, housingPmt: 650,
-    bufferEur: 3000, homeEquity: 25000,
+    bufferEur: 3000, bufferMonthsTarget: 6, homeEquity: 25000, mortgageBalance: 0,
     investEur: 500, extraIncome: 0, playEur: 0, annualReturn: 7, hasPlan: false,
 };
 const loadProfile = () => {
@@ -138,6 +152,18 @@ const loadProfile = () => {
         return raw ? { ...DEFAULT_PROFILE, ...JSON.parse(raw) } : null;
     } catch { return null; }
 };
+
+// the same levers also live in data/money-system.json so Claude can read and edit
+// them via MCP (get_money_system, log_mortgage_payment, log_buffer_change…).
+// The file is the source of truth; localStorage is a cache for the wizard state.
+const MONEY_KEYS = Object.keys(DEFAULT_PROFILE);
+const pickMoney = (m) => Object.fromEntries(MONEY_KEYS.map((k) => [k, m[k] ?? DEFAULT_PROFILE[k]]));
+const postMoney = (p) =>
+    fetch("/api/money-system", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pickMoney(p)),
+    }).catch(() => { });
 
 const Card = ({ title, sub, onEdit, children, style }) => (
     <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 10, padding: 20, ...style }}>
@@ -301,11 +327,14 @@ export default function MoneySystemDashboard() {
     const [saveState, setSaveState] = useState("");
     const [draftFrom, setDraftFrom] = useState(null); // lens key when a model mix is loaded, unsaved
     const [lens, setLens] = useState("kress");
-    const [plan, setPlan] = useState(null);           // investment plan written via Claude's guided interview
+    const [plan, setPlan] = useState(null);           // investment plan / declaration (written via Claude or the inline editor)
     const [priceMsg, setPriceMsg] = useState("");
+    const [planDraft, setPlanDraft] = useState(null); // non-null while the inline declaration editor is open
+    const [planSaveState, setPlanSaveState] = useState("");
 
     const set = (field) => (v) => setProfile((p) => ({ ...p, [field]: v }));
-    const { income, expenses, housingPmt, bufferEur, homeEquity, investEur, extraIncome, playEur, annualReturn, hasPlan } = profile;
+    const { income, expenses, housingPmt, bufferEur, bufferMonthsTarget, homeEquity, mortgageBalance, investEur, extraIncome, playEur, annualReturn, hasPlan } = profile;
+    const bufTarget = bufferMonthsTarget ?? 6;
 
     // load the portfolio the MCP server maintains
     const fetchHoldings = () =>
@@ -319,12 +348,52 @@ export default function MoneySystemDashboard() {
             .then((r) => (r.ok ? r.json() : null))
             .then((p) => { if (p && p.sections) setPlan(p); })
             .catch(() => { });
+        // levers from the shared file win over localStorage — Claude may have edited them via MCP
+        fetch("/api/money-system")
+            .then((r) => (r.ok ? r.json() : null))
+            .then((m) => {
+                if (m && typeof m.income === "number") {
+                    setProfile((p) => ({ ...p, ...pickMoney(m) }));
+                    setStep(4);
+                } else if (saved) {
+                    postMoney(saved); // one-time migration of a pre-file profile into data/
+                }
+            })
+            .catch(() => { });
     }, []);
 
     // a saved plan file counts as a written plan, regardless of the wizard answer
     const effHasPlan = hasPlan || !!plan;
 
-    const persistProfile = () => localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+    const persistProfile = () => {
+        localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+        postMoney(profile);
+    };
+
+    // inline investment-declaration editor (an alternative to writing it via Claude's guided interview)
+    const openPlanEditor = () => {
+        const base = Object.fromEntries(Object.keys(PLAN_TITLES).map((k) => [k, plan?.sections?.[k] ?? ""]));
+        setPlanDraft(base);
+        setPlanSaveState("");
+    };
+    const updPlanField = (k, v) => setPlanDraft((p) => ({ ...p, [k]: v }));
+    const savePlan = async () => {
+        const sections = Object.fromEntries(
+            Object.entries(planDraft).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()]),
+        );
+        if (Object.keys(sections).length === 0) { setPlanSaveState("empty"); return; }
+        setPlanSaveState("saving");
+        try {
+            const r = await fetch("/api/plan", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sections }),
+            });
+            if (!r.ok) { setPlanSaveState("error"); return; }
+            setPlan(await r.json());
+            setPlanDraft(null);
+            setPlanSaveState("");
+        } catch { setPlanSaveState("error"); }
+    };
 
     const saveHoldings = async () => {
         setSaveState("saving");
@@ -515,6 +584,70 @@ export default function MoneySystemDashboard() {
         ];
     }, [d, hasPlan, effHasPlan, plan, extraIncome, playEur, income]);
 
+    // the steering layer: rank the gaps vs the investors' bars, worst first.
+    // rank 0 = do this before anything else; higher = can wait.
+    const priorities = useMemo(() => {
+        const list = [];
+        const bufferTarget = d.essentials * bufTarget;
+        if (d.essentials > 0 && d.bufferMonths < bufTarget) {
+            const gap = bufferTarget - bufferEur;
+            const monthsToFull = d.freeCash > 0 ? Math.ceil(gap / d.freeCash) : null;
+            const frac = d.bufferMonths / bufTarget;
+            list.push({
+                rank: frac < 0.17 ? 0 : frac < 0.5 ? 0.5 : 3,
+                title: frac < 0.17 ? "Build your emergency buffer — it's nearly empty"
+                    : frac < 0.5 ? "Keep filling the emergency buffer"
+                        : "Buffer past halfway — finish it",
+                now: bufferEur, goal: bufferTarget, color: T.buffer, edit: 1,
+                detail: `${eur(bufferEur)} of ${eur(bufferTarget)} — ${d.bufferMonths.toFixed(1)} of your ${bufTarget}-month target (essentials ${eur(d.essentials)}/mo).`,
+                why: `Kress recommends 6–9 months of essentials in zero-risk cash — the calm end of the barbell, before anything speculative. Saare skips the classic buffer, but only behind a large liquid portfolio and stable income${d.liquidMonths >= 6 ? ", which you arguably have — treat this one as a design choice" : ", which you don't have yet (" + d.liquidMonths.toFixed(1) + " months liquid)"}.`,
+                action: d.freeCash > 0 && monthsToFull
+                    ? `Route your ${eur(d.freeCash)}/mo free cash here first — full in ~${monthsToFull} month${monthsToFull > 1 ? "s" : ""}, then redirect it to investing.`
+                    : "There is no free cash to fill it with — the income side is the real lever here.",
+            });
+        }
+        if (!effHasPlan) list.push({
+            rank: 1, title: "Write your investment declaration", color: T.ink,
+            detail: "Both investors' first rule, and the first row of both scorecards — currently a miss.",
+            why: "Kress: decisions follow the written document, not the mood — it exists precisely for the −40% day. Saare: write it down so discipline survives the swings.",
+            action: "Run `claude` in a terminal and say \"Help me write my investment plan\" — a guided interview saves it here.",
+        });
+        if (d.specShare > 0.15) list.push({
+            rank: 1.5, title: "Speculation is over the fence", now: d.specShare, goal: 0.15, fmt: pct, color: T.play, edit: 3,
+            detail: `${pct(d.specShare)} of liquid assets is crypto/commodities/play money — Kress caps it at 10–15%.`,
+            why: "The cap exists to quarantine gambling urges so they never touch the long-term core.",
+            action: `Trim ~${eur((d.specShare - 0.15) * d.liquid)} back toward the index core, or stop topping the pocket up.`,
+        });
+        {
+            const ls = d.share(Number(d.largestSingle.amountEur) || 0);
+            if (ls > 0.10) list.push({
+                rank: 2, title: `One name can hurt you: ${d.largestSingle.name}`, now: ls, goal: 0.10, fmt: pct, color: T.satellite, edit: 2,
+                detail: `${pct(ls)} of the portfolio sits in a single company.`,
+                why: "Kress spreads ~60 names so no single dividend cut matters — a single position stays a few percent.",
+                action: "Add to the index core instead of this name until it dilutes below 10%.",
+            });
+        }
+        if (d.share(d.baltic) > 0.25) list.push({
+            rank: 2.5, title: "Heavy Baltic home bias", now: d.share(d.baltic), goal: 0.25, fmt: pct, color: T.satellite, edit: 2,
+            detail: `${pct(d.share(d.baltic))} of the portfolio is on Nasdaq Baltic.`,
+            why: "Kress largely exited it (reliable dividend growers are scarce); Saare keeps home markets small and rides the US.",
+            action: "Point new purchases at broad global/US funds until the share falls.",
+        });
+        if (d.slack > 50) list.push({
+            rank: 4, title: `${eur(d.slack)}/mo of free cash is unallocated`, color: T.lever, edit: 3,
+            detail: `You earn ${eur(d.freeCash)}/mo above your costs but only ${eur(d.invest)} is deliberately invested.`,
+            why: "Saare: pay yourself first — anything not allocated on payday evaporates into lifestyle.",
+            action: "Raise the monthly investing amount, or send the slack to the buffer while it's below target.",
+        });
+        if (extraIncome === 0) list.push({
+            rank: 5, title: "No income lever planned", color: T.lever, edit: 3,
+            detail: "The projection below shows what a raise or side income would compound into.",
+            why: "Saare's 10x-growth point: past a savings wall, raising income beats any expense cut.",
+            action: "Pick one concrete move — raise, switch, side income — and put a €/month number on it.",
+        });
+        return list.sort((a, b) => a.rank - b.rank);
+    }, [d, bufferEur, bufTarget, effHasPlan, extraIncome]);
+
     // shared editor for the holdings list
     const updHolding = (i, field, v) =>
         setHoldings(holdings.map((h, j) => (j === i ? { ...h, [field]: v } : h)));
@@ -656,12 +789,20 @@ export default function MoneySystemDashboard() {
             case 1: return (
                 <>
                     <Field label="Emergency buffer (cash, instantly available)"
-                        why={<>Kress's barbell: 6–9 months of essential costs in zero-risk cash before anything speculative. Your essentials are {eur(d.essentials)}/mo, so 6 months = <b>{eur(d.essentials * 6)}</b>. Saare's counter-view: once the liquid portfolio is large and income stable, the buffer can be a design choice.</>}>
+                        why={<>Zero-risk cash before anything speculative. Your essentials are {eur(d.essentials)}/mo, so your {bufTarget}-month target = <b>{eur(d.essentials * bufTarget)}</b>. <b>Kress recommends 6–9 months</b>; <b>Saare's counter-view</b>: once the liquid portfolio is large and income stable, the buffer can be a design choice.</>}>
                         <RangeWithValue value={bufferEur} onChange={set("bufferEur")} min={0} max={30000} step={250} accent={T.buffer} />
+                    </Field>
+                    <Field label="Your buffer target (months of essential costs)"
+                        why={<>How many months of essentials you want parked in cash — your call, not a fixed rule. Kress's range is 6–9; Saare runs lower on purpose. At {eur(d.essentials)}/mo essentials, {bufTarget} months = <b>{eur(d.essentials * bufTarget)}</b>. This target drives the buffer meter and the "What to fix first" card.</>}>
+                        <RangeWithValue value={bufTarget} onChange={set("bufferMonthsTarget")} min={0} max={12} step={1} format={(v) => v + " mo"} accent={T.buffer} />
                     </Field>
                     <Field label="Home equity (your share of your home's value)"
                         why="Market value minus remaining loan. It stabilizes net worth but produces no cash flow — both investors treat the home as shelter, not portfolio. Set 0 if renting.">
                         <RangeWithValue value={homeEquity} onChange={set("homeEquity")} min={0} max={200000} step={1000} accent={T.home} />
+                    </Field>
+                    <Field label="Remaining mortgage balance (loan principal still owed)"
+                        why="What's left on the loan. Each mortgage payment moves its principal portion out of here and into home equity — tell Claude 'paid my mortgage, 550 was principal' and it updates both. Set 0 if you rent or own outright.">
+                        <RangeWithValue value={mortgageBalance} onChange={set("mortgageBalance")} min={0} max={400000} step={1000} accent={T.home} />
                     </Field>
                 </>
             );
@@ -762,9 +903,10 @@ export default function MoneySystemDashboard() {
 
     const model = MODELS[lens];
     const modelRows = Object.entries(model.targets).map(([k, target]) => {
-        const youShare = d.share(d.buckets[k]);
-        const deltaEur = (target - youShare) * d.invested;
-        return { k, label: BUCKET_LABEL[k], youShare, target, deltaEur };
+        const youShare = d.share(d.buckets[k]);   // your real share of invested assets
+        const deltaPP = target - youShare;        // gap in percentage points (of real portfolio)
+        const deltaEur = deltaPP * d.invested;
+        return { k, label: BUCKET_LABEL[k], youShare, target, deltaPP, deltaEur };
     });
     const tryModel = () => {
         const total = Math.max(d.invested, 1000);
@@ -774,6 +916,57 @@ export default function MoneySystemDashboard() {
     };
 
     const postCrashBufferMonths = d.essentials > 0 ? Math.max(0, d.postCrashLiquid) / d.essentials : 0;
+
+    // investment declaration — both investors' first rule, so it leads the dashboard.
+    const declarationCard = (
+        <Card title="Your investment declaration"
+            sub={plan
+                ? `Both investors' first rule · last updated ${new Date(plan.updatedAt).toLocaleDateString("et-EE")}. Kress: on the −40% day, decisions follow this document, not the mood.`
+                : "Not written yet — both investors' first rule, and the first row of both scorecards."}
+            onEdit={planDraft ? undefined : openPlanEditor}
+            style={{ marginBottom: 16 }}>
+            {planDraft ? (
+                <div>
+                    <p style={{ fontSize: 13, color: T.inkSoft, margin: "0 0 14px", lineHeight: 1.5, maxWidth: 720 }}>
+                        Fill what you can — every field is optional and editable later. Prefer a guided walk-through? Run <code style={{ fontFamily: T.mono, fontSize: 12, background: T.paper, padding: "1px 5px", borderRadius: 4 }}>claude</code> and
+                        say <i>"Help me write my investment plan"</i> — same file, one question at a time.
+                    </p>
+                    {Object.entries(PLAN_TITLES).map(([k, title]) => (
+                        <div key={k} style={{ marginBottom: 14 }}>
+                            <label style={{ display: "block", fontSize: 13, fontWeight: 700, marginBottom: 2 }}>{title}</label>
+                            <div style={{ fontSize: 12, color: T.inkSoft, marginBottom: 5, lineHeight: 1.45, maxWidth: 720 }}>{PLAN_HINTS[k]}</div>
+                            <textarea value={planDraft[k]} onChange={(e) => updPlanField(k, e.target.value)} rows={2}
+                                style={{ width: "100%", maxWidth: 720, boxSizing: "border-box", fontSize: 13, fontFamily: T.sans, padding: "7px 9px", border: `1px solid ${T.baseline}`, borderRadius: 6, resize: "vertical" }} />
+                        </div>
+                    ))}
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 4 }}>
+                        <button onClick={savePlan} style={{ border: "none", background: T.ink, color: "#fff", borderRadius: 8, padding: "9px 18px", cursor: "pointer", fontSize: 13, fontWeight: 700 }}>Save declaration</button>
+                        <button onClick={() => { setPlanDraft(null); setPlanSaveState(""); }} style={{ border: `1px solid ${T.baseline}`, background: "none", borderRadius: 8, padding: "8px 16px", cursor: "pointer", fontSize: 13, fontWeight: 600, color: T.inkSoft }}>Cancel</button>
+                        {planSaveState === "saving" && <span style={{ fontSize: 12, color: T.inkSoft }}>Saving…</span>}
+                        {planSaveState === "empty" && <span style={{ fontSize: 12, color: T.act, fontWeight: 600 }}>Fill at least one section.</span>}
+                        {planSaveState === "error" && <span style={{ fontSize: 12, color: T.act, fontWeight: 600 }}>Save failed.</span>}
+                    </div>
+                </div>
+            ) : plan ? (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "4px 24px" }}>
+                    {Object.entries(PLAN_TITLES).map(([key, title]) =>
+                        plan.sections[key] ? (
+                            <div key={key} style={{ padding: "8px 0", borderBottom: `1px solid ${T.line}` }}>
+                                <div style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: T.muted, fontWeight: 700, marginBottom: 2 }}>{title}</div>
+                                <div style={{ fontSize: 13, lineHeight: 1.5 }}>{plan.sections[key]}</div>
+                            </div>
+                        ) : null,
+                    )}
+                </div>
+            ) : (
+                <div style={{ fontSize: 13.5, color: T.inkSoft, lineHeight: 1.6 }}>
+                    Both investors' first rule, and currently a miss on both scorecards below. Two ways to write it:
+                    hit <b>Edit</b> above to fill it in here, or run <code style={{ fontFamily: T.mono, fontSize: 12.5, background: T.paper, padding: "2px 6px", borderRadius: 4 }}>claude</code> and
+                    say <i>"Help me write my investment plan"</i> for a guided interview — one question at a time, grounded in Kress's and Saare's principles. Either way it saves to the same file and flips the "written plan" rows to pass.
+                </div>
+            )}
+        </Card>
+    );
 
     return (
         <div style={{ background: T.paper, minHeight: "100vh", padding: "28px 20px", fontFamily: T.sans, color: T.ink }}>
@@ -795,12 +988,73 @@ export default function MoneySystemDashboard() {
                     }}>↺ Redo the questions</button>
                 </div>
 
+                {/* investment declaration — both investors' first rule, leads the page */}
+                {declarationCard}
+
+                {/* steering: what to fix first */}
+                <Card
+                    title="What to fix first"
+                    sub="Your numbers against both investors' bars, worst gap on top. Fix the top one; the rest can wait."
+                    style={{ marginBottom: 16 }}>
+                    {priorities.length === 0 ? (
+                        <div style={{ fontSize: 14, color: T.ok, fontWeight: 600 }}>
+                            ✓ Nothing urgent — the system passes both investors' primary bars. Keep the monthly rhythm going.
+                        </div>
+                    ) : (
+                        <>
+                            {(() => {
+                                const hero = priorities[0];
+                                const fmt = hero.fmt ?? eur;
+                                return (
+                                    <div style={{ marginBottom: priorities.length > 1 ? 18 : 0 }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+                                            <div style={{ fontSize: 19, fontWeight: 800, letterSpacing: "-0.01em" }}>{hero.title}</div>
+                                            {hero.edit !== undefined && (
+                                                <button onClick={() => setStep(hero.edit)} style={{
+                                                    fontSize: 12, fontWeight: 600, color: T.buffer, background: "none",
+                                                    border: `1px solid ${T.line}`, borderRadius: 6, padding: "4px 10px", cursor: "pointer",
+                                                }}>Edit</button>
+                                            )}
+                                        </div>
+                                        {hero.goal !== undefined && (
+                                            <div style={{ margin: "10px 0 6px", maxWidth: 720 }}>
+                                                <div style={{ height: 26, background: T.paper, borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}` }}>
+                                                    <div style={{
+                                                        width: `${Math.min(100, (hero.now / hero.goal) * 100)}%`, height: "100%",
+                                                        background: hero.color, transition: "width 300ms ease", minWidth: 3,
+                                                    }} />
+                                                </div>
+                                                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.inkSoft, marginTop: 3 }}>
+                                                    <Num size={13}>{fmt(hero.now)}</Num>
+                                                    <span>target <Num size={13}>{fmt(hero.goal)}</Num></span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div style={{ fontSize: 13.5, lineHeight: 1.55, maxWidth: 720 }}>{hero.detail}</div>
+                                        <div style={{ fontSize: 13, color: T.inkSoft, lineHeight: 1.55, maxWidth: 720, marginTop: 6 }}>{hero.why}</div>
+                                        <div style={{ fontSize: 13.5, fontWeight: 600, marginTop: 8, maxWidth: 720 }}>→ {hero.action}</div>
+                                    </div>
+                                );
+                            })()}
+                            {priorities.slice(1, 4).map((p, i) => (
+                                <div key={p.title} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "8px 0", borderTop: `1px solid ${T.line}` }}>
+                                    <span style={{ fontFamily: T.mono, fontSize: 12, color: T.muted, fontWeight: 700 }}>{i + 2}.</span>
+                                    <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+                                        <span style={{ fontWeight: 700 }}>{p.title}</span>
+                                        <span style={{ color: T.inkSoft }}> — {p.detail} {p.action}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </>
+                    )}
+                </Card>
+
                 {/* KPI row */}
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12 }}>
                     <StatTile label="Net worth" value={eur(d.netWorth)} note="all layers combined" />
                     <StatTile label="Free cash" value={eur(d.freeCash) + "/mo"} note="income − costs" color={d.freeCash >= 0 ? T.ink : T.act} />
                     <StatTile label="Savings rate" value={(d.savingsRate * 100).toFixed(0) + " %"} note="of net income" />
-                    <StatTile label="Buffer" value={d.bufferMonths.toFixed(1) + " mo"} note="of essential costs" color={d.bufferMonths >= 6 ? T.ink : T.act} />
+                    <StatTile label="Buffer" value={d.bufferMonths.toFixed(1) + " mo"} note={`of ${bufTarget}-mo target`} color={d.bufferMonths >= bufTarget ? T.ink : T.act} />
                     <StatTile label="Portfolio return"
                         value={d.earningsPct === null ? "—" : `${d.earningsPct >= 0 ? "+" : ""}${(d.earningsPct * 100).toFixed(1)} %`}
                         note={d.earningsPct === null ? "add tickers & refresh prices" : `${eur(d.basisCur - d.basisCost)} vs cost basis`}
@@ -858,6 +1112,37 @@ export default function MoneySystemDashboard() {
                     </Card>
                 </div>
 
+                {/* home & mortgage */}
+                {(homeEquity > 0 || mortgageBalance > 0) && (() => {
+                    const propertyValue = homeEquity + mortgageBalance;
+                    const equityShare = propertyValue > 0 ? homeEquity / propertyValue : 0;
+                    return (
+                        <Card title="Home & mortgage"
+                            sub="Your home is shelter, not portfolio — both investors keep it out of the invested mix. Each mortgage payment's principal moves the loan into equity."
+                            onEdit={() => setStep(1)} style={{ marginTop: 16 }}>
+                            <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 14 }}>
+                                <div><div style={{ fontSize: 12, color: T.inkSoft }}>Property value</div><Num size={20}>{eur(propertyValue)}</Num></div>
+                                <div><div style={{ fontSize: 12, color: T.inkSoft }}>Home equity (yours)</div><Num size={20} color={T.home}>{eur(homeEquity)}</Num></div>
+                                <div><div style={{ fontSize: 12, color: T.inkSoft }}>Remaining loan</div><Num size={20} color={mortgageBalance > 0 ? T.act : T.ok}>{eur(mortgageBalance)}</Num></div>
+                                <div><div style={{ fontSize: 12, color: T.inkSoft }}>Owned outright</div><Num size={20}>{pct(equityShare)}</Num></div>
+                            </div>
+                            <div style={{ height: 22, background: T.paper, borderRadius: 8, overflow: "hidden", border: `1px solid ${T.line}`, display: "flex" }}>
+                                <div title={`Equity ${eur(homeEquity)}`} style={{ width: `${equityShare * 100}%`, background: T.home, transition: "width 300ms ease" }} />
+                                <div title={`Owed ${eur(mortgageBalance)}`} style={{ width: `${(1 - equityShare) * 100}%`, background: T.baseline, transition: "width 300ms ease" }} />
+                            </div>
+                            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: T.inkSoft, marginTop: 4 }}>
+                                <span><span style={{ display: "inline-block", width: 9, height: 9, background: T.home, borderRadius: 2, marginRight: 5 }} />Your equity</span>
+                                <span>Still owed the bank<span style={{ display: "inline-block", width: 9, height: 9, background: T.baseline, borderRadius: 2, marginLeft: 5 }} /></span>
+                            </div>
+                            {mortgageBalance > 0 && (
+                                <div style={{ fontSize: 12.5, color: T.inkSoft, marginTop: 10, lineHeight: 1.5 }}>
+                                    Tell Claude <i>"paid my mortgage, {"{"}principal{"}"} was principal"</i> and it shifts that amount from the loan into your equity here.
+                                </div>
+                            )}
+                        </Card>
+                    );
+                })()}
+
                 {/* portfolio risk */}
                 <Card title="Portfolio risk" sub="A rough 2008-style stress test plus the four exposures both investors manage first. Play with the assets above — this updates live." style={{ marginTop: 16 }}>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
@@ -905,22 +1190,30 @@ export default function MoneySystemDashboard() {
                             <thead>
                                 <tr>
                                     <th style={th}>Bucket</th>
-                                    <th style={th}>You</th>
+                                    <th style={th}>You now</th>
                                     <th style={th}>Target</th>
-                                    <th style={th}>To get there</th>
+                                    <th style={th}>Gap (pp of your portfolio)</th>
+                                    <th style={th}>Move</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {modelRows.map((r) => (
-                                    <tr key={r.k}>
-                                        <td style={{ ...td, fontWeight: 600 }}>{r.label}</td>
-                                        <td style={{ ...td, fontFamily: T.mono }}>{pct(r.youShare)}</td>
-                                        <td style={{ ...td, fontFamily: T.mono }}>{pct(r.target)}</td>
-                                        <td style={{ ...td, fontFamily: T.mono, color: Math.abs(r.deltaEur) < 50 ? T.ok : r.deltaEur > 0 ? T.inkSoft : T.watch, whiteSpace: "nowrap" }}>
-                                            {Math.abs(r.deltaEur) < 50 ? "✓ on target" : `${r.deltaEur > 0 ? "+" : "−"}${eur(Math.abs(r.deltaEur))}`}
-                                        </td>
-                                    </tr>
-                                ))}
+                                {modelRows.map((r) => {
+                                    const onTarget = Math.abs(r.deltaPP) < 0.02;
+                                    const ppTxt = `${r.deltaPP > 0 ? "+" : "−"}${Math.abs(r.deltaPP * 100).toFixed(1)} pp`;
+                                    return (
+                                        <tr key={r.k}>
+                                            <td style={{ ...td, fontWeight: 600 }}>{r.label}</td>
+                                            <td style={{ ...td, fontFamily: T.mono }}>{pct(r.youShare)}</td>
+                                            <td style={{ ...td, fontFamily: T.mono, color: T.inkSoft }}>{pct(r.target)}</td>
+                                            <td style={{ ...td, fontFamily: T.mono, whiteSpace: "nowrap", color: onTarget ? T.ok : r.deltaPP > 0 ? T.inkSoft : T.watch }}>
+                                                {onTarget ? "✓ on target" : ppTxt}
+                                            </td>
+                                            <td style={{ ...td, fontFamily: T.mono, whiteSpace: "nowrap", color: onTarget ? T.muted : r.deltaEur > 0 ? T.inkSoft : T.watch }}>
+                                                {onTarget ? "—" : `${r.deltaEur > 0 ? "add " : "trim "}${eur(Math.abs(r.deltaEur))}`}
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
                             </tbody>
                         </table>
                     </div>
@@ -943,32 +1236,6 @@ export default function MoneySystemDashboard() {
                         <ScoreTable rows={saareRows} />
                     </Card>
                 </div>
-
-                {/* investment declaration */}
-                <Card title="Your investment declaration"
-                    sub={plan
-                        ? `Written with Claude's guided interview · last updated ${new Date(plan.updatedAt).toLocaleDateString("et-EE")}. Kress's rule: on the -40% day, decisions follow this document, not the mood.`
-                        : "Not written yet — both investors' first rule."}
-                    style={{ marginTop: 16 }}>
-                    {plan ? (
-                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "4px 24px" }}>
-                            {Object.entries(PLAN_TITLES).map(([key, title]) =>
-                                plan.sections[key] ? (
-                                    <div key={key} style={{ padding: "8px 0", borderBottom: `1px solid ${T.line}` }}>
-                                        <div style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: T.muted, fontWeight: 700, marginBottom: 2 }}>{title}</div>
-                                        <div style={{ fontSize: 13, lineHeight: 1.5 }}>{plan.sections[key]}</div>
-                                    </div>
-                                ) : null,
-                            )}
-                        </div>
-                    ) : (
-                        <div style={{ fontSize: 13.5, color: T.inkSoft, lineHeight: 1.6 }}>
-                            Open a terminal, run <code style={{ fontFamily: T.mono, fontSize: 12.5, background: T.paper, padding: "2px 6px", borderRadius: 4 }}>claude</code> and
-                            say <i>"Help me write my investment plan"</i>. Claude runs a guided interview — one question at a time, each grounded in
-                            Kress's and Saare's published principles — and saves the result here. It also flips the "written plan" rows above to pass.
-                        </div>
-                    )}
-                </Card>
 
                 {/* projection */}
                 <Card
